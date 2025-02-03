@@ -12,13 +12,14 @@ from two_tower_model import TwoTowerModel
 from dataset_ms_marco import MSMarcoTripletDataset
 from tokenizer import simple_tokenize, tokens_to_indices
 
-# ------------------------
-# Function to load MS MARCO dataset (v1.1) with caching.
+##########################
+# Helper Functions
+##########################
+
 def load_ms_marco(cache_dir="data/cache"):
     dataset = load_dataset("ms_marco", "v1.1", cache_dir=cache_dir)
     return dataset["train"], dataset["validation"], dataset["test"]
 
-# Debug function to inspect a few samples.
 def debug_samples(train_dataset, num_samples=3):
     print("\n--- Debug: Printing first {} samples ---".format(num_samples))
     for i in range(num_samples):
@@ -27,78 +28,89 @@ def debug_samples(train_dataset, num_samples=3):
         print(sample)
         print("-" * 80)
 
-# Extract all positive passages from a sample.
 def extract_positives(sample):
+    """Return a list of (positive_text, weight) tuples from a sample."""
     positives = []
-    # For MS MARCO v1.1, the sample has a "passages" field (a dict with keys "is_selected" and "passage_text").
     if "passages" in sample and sample["passages"]:
         passages = sample["passages"]
         is_selected = passages.get("is_selected", [])
         passage_texts = passages.get("passage_text", [])
         for idx, text in enumerate(passage_texts):
-            # If is_selected == 1, assign a higher weight (e.g., 2.0), otherwise 1.0.
+            # Higher weight for selected passages (is_selected==1), lower weight otherwise.
             weight = 2.0 if idx < len(is_selected) and is_selected[idx] == 1 else 1.0
             positives.append((text, weight))
     return positives
 
-# Build a negative sampling corpus from all training samples.
-def build_negative_corpus(train_dataset):
+def build_negative_corpus(dataset):
     corpus = set()
-    for sample in train_dataset:
-        pos_list = extract_positives(sample)
-        for pos, _ in pos_list:
+    for sample in dataset:
+        for pos, _ in extract_positives(sample):
             corpus.add(pos)
     return list(corpus)
 
-# Sample a negative passage (ensuring it isn’t identical to the positive).
-def sample_negative(positive, corpus):
-    if not corpus:
-        return ""
-    neg = positive
-    tries = 0
-    while neg == positive and tries < 10:
-        neg = random.choice(corpus)
-        tries += 1
-    return neg
+def sample_hard_negative(query, positive, corpus, vocab_dictionary, embedding_matrix, candidate_pool_size=10):
+    # Compute a simple average embedding (using pretrained embedding_matrix) for the text.
+    def average_embedding(text):
+        tokens = simple_tokenize(text)
+        indices = tokens_to_indices(tokens, vocab_dictionary)
+        if len(indices) == 0:
+            return None
+        vecs = embedding_matrix[indices]  # shape: [num_tokens, emb_dim]
+        avg = vecs.mean(dim=0)
+        norm = avg.norm() + 1e-8
+        return avg / norm
 
-# Generate triplets from the training dataset.
+    q_emb = average_embedding(query)
+    if q_emb is None:
+        return random.choice(corpus)
+    candidates = random.sample(corpus, min(candidate_pool_size, len(corpus)))
+    best_sim = -1.0
+    best_candidate = None
+    for cand in candidates:
+        cand_emb = average_embedding(cand)
+        if cand_emb is None:
+            continue
+        sim = torch.dot(q_emb, cand_emb).item()  # cosine similarity (since normalized)
+        if sim > best_sim:
+            best_sim = sim
+            best_candidate = cand
+    if best_candidate is None:
+        return random.choice(corpus)
+    return best_candidate
+
 def generate_triplets(train_dataset, max_samples=50000):
     triplets = []
     num_samples = min(max_samples, len(train_dataset))
     for i in range(num_samples):
         sample = train_dataset[i]
         query = sample.get("query", "")
-        positives = extract_positives(sample)
-        if not query or not positives:
+        pos_list = extract_positives(sample)
+        if not query or not pos_list:
             continue
-        for pos, weight in positives:
-            triplets.append((query, pos, None, weight))  # Negative will be filled later.
+        for pos, weight in pos_list:
+            triplets.append((query, pos, None, weight))  # negative to be filled later.
     return triplets
 
-# Assign negatives to the triplets.
-def assign_negatives(triplets, negative_corpus):
+def assign_negatives(triplets, negative_corpus, vocab_dictionary, embedding_matrix):
     new_triplets = []
     for (query, pos, _, weight) in triplets:
-        neg = sample_negative(pos, negative_corpus)
+        neg = sample_hard_negative(query, pos, negative_corpus, vocab_dictionary, embedding_matrix)
         new_triplets.append((query, pos, neg, weight))
     return new_triplets
 
-# Load pretrained Word2Vec embeddings via gensim and reindex the vocabulary.
 def load_pretrained_embeddings():
     import gensim.downloader as api
     print("Loading pretrained Word2Vec (Google News 300)...")
     w2v_model = api.load('word2vec-google-news-300')
     embedding_dim = w2v_model.vector_size
-    vocab_list = w2v_model.index_to_key  # Original gensim vocabulary.
+    vocab_list = w2v_model.index_to_key
 
-    # Build a mapping from lowercased token to its original token (first occurrence).
     temp_dict = {}
     for word in vocab_list:
         lw = word.lower()
         if lw not in temp_dict:
             temp_dict[lw] = word
 
-    # Reindex so that tokens get contiguous indices.
     new_vocab_dictionary = {}
     embedding_vectors = []
     new_index = 0
@@ -115,7 +127,6 @@ def load_pretrained_embeddings():
     embedding_matrix = torch.tensor(embedding_matrix, dtype=torch.float)
     return vocab_dictionary, embedding_matrix
 
-# Cache document embeddings from a list of candidate documents.
 def cache_document_encodings(model, docs, device, max_length):
     import torch.nn.functional as F
     encodings = []
@@ -133,7 +144,6 @@ def cache_document_encodings(model, docs, device, max_length):
             encodings.append(F.normalize(enc, p=2, dim=1).squeeze(0))
     return torch.stack(encodings)
 
-# Infer the top-k matching document given a query.
 def infer_top_k(query_text, model, cached_docs, vocab_dictionary, max_length, k=1, device="cpu"):
     import torch.nn.functional as F
     tokens = simple_tokenize(query_text)
@@ -151,65 +161,112 @@ def infer_top_k(query_text, model, cached_docs, vocab_dictionary, max_length, k=
     topk = torch.topk(sims, k=k)
     return topk.indices.cpu(), topk.values.cpu()
 
-def main():
-    # Step 1: Load MS MARCO dataset.
-    print("Loading MS MARCO dataset...")
-    train_dataset, val_dataset, test_dataset = load_ms_marco()
-    print("Train dataset size:", len(train_dataset))
+def average_embedding(text, vocab_dictionary, embedding_matrix):
+    tokens = simple_tokenize(text)
+    indices = tokens_to_indices(tokens, vocab_dictionary)
+    if len(indices) == 0:
+        return None
+    vecs = embedding_matrix[indices]
+    avg = vecs.mean(dim=0)
+    norm = avg.norm() + 1e-8
+    return avg / norm
 
-    # Step 2: Debug - Print first 3 samples.
-    debug_samples(train_dataset, num_samples=3)
+def evaluate_model(model, val_dataset, vocab_dictionary, embedding_matrix, max_length, device, num_queries=200):
+    import torch.nn.functional as F
+    # Build candidate corpus from first num_queries validation samples.
+    candidates = []
+    ground_truth = []
+    for i in range(min(num_queries, len(val_dataset))):
+        sample = val_dataset[i]
+        query = sample.get("query", "")
+        pos = extract_positives(sample)
+        if not query or not pos:
+            continue
+        # For evaluation, take the first positive as ground truth.
+        candidates.append(pos[0][0])
+        ground_truth.append(pos[0][0])
+    if not candidates:
+        return 0.0
+    candidate_embs = []
+    for doc in candidates:
+        emb = average_embedding(doc, vocab_dictionary, embedding_matrix)
+        if emb is not None:
+            candidate_embs.append(emb)
+    if not candidate_embs:
+        return 0.0
+    candidate_embs = torch.stack(candidate_embs, dim=0)  # shape: [num_candidates, emb_dim]
 
-    # Step 3: Build negative sampling corpus and generate triplets.
+    mrr_total = 0.0
+    count = 0
+    for i in range(min(num_queries, len(val_dataset))):
+        sample = val_dataset[i]
+        query = sample.get("query", "")
+        pos = extract_positives(sample)
+        if not query or not pos:
+            continue
+        true_doc = pos[0][0]
+        q_emb = average_embedding(query, vocab_dictionary, embedding_matrix)
+        if q_emb is None:
+            continue
+        sims = torch.matmul(candidate_embs, q_emb.unsqueeze(1)).squeeze(1)
+        sorted_indices = torch.argsort(sims, descending=True)
+        # Find rank of the true document in the candidate set.
+        try:
+            rank = (sorted_indices == i).nonzero(as_tuple=True)[0].item() + 1
+            mrr_total += 1.0 / rank
+            count += 1
+        except Exception as e:
+            continue
+    mrr = mrr_total / count if count > 0 else 0.0
+    return mrr
+
+##########################
+# Hyperparameter Configurations
+##########################
+hyperparameter_configs = [
+    {"lr": 0.001, "margin": 0.2, "freeze_embeddings": False, "batch_size": 64, "num_epochs": 5},
+    {"lr": 0.0005, "margin": 0.2, "freeze_embeddings": False, "batch_size": 64, "num_epochs": 10},
+    {"lr": 0.001, "margin": 0.3, "freeze_embeddings": False, "batch_size": 128, "num_epochs": 5},
+    {"lr": 0.001, "margin": 0.2, "freeze_embeddings": True,  "batch_size": 64, "num_epochs": 5},
+    {"lr": 0.002, "margin": 0.2, "freeze_embeddings": False, "batch_size": 32, "num_epochs": 5}
+]
+
+def run_experiment(config, train_dataset, val_dataset, vocab_dictionary, embedding_matrix):
+    print("\n\n=== Running Configuration ===")
+    print(config)
+    # Build negative corpus and generate triplets from training data.
     negative_corpus = build_negative_corpus(train_dataset)
-    print("Negative sampling corpus size:", len(negative_corpus))
     triplets = generate_triplets(train_dataset, max_samples=50000)
-    triplets = assign_negatives(triplets, negative_corpus)
+    # Use hard negative sampling.
+    triplets = assign_negatives(triplets, negative_corpus, vocab_dictionary, embedding_matrix)
     print("Generated", len(triplets), "triplets for training.")
-    print("\n--- Example Triplets ---")
-    for t in triplets[:3]:
-        print("Query:", t[0])
-        print("Positive:", t[1][:150] + "...")
-        print("Negative:", t[2][:150] + "...")
-        print("Weight:", t[3])
-        print("-" * 80)
 
-    # Step 4: Load pretrained embeddings and build vocabulary.
-    global vocab_dictionary  # Make it global for helper functions.
-    vocab_dictionary, embedding_matrix = load_pretrained_embeddings()
-
-    # Step 5: Create the PyTorch Dataset and DataLoader.
+    # Create Dataset and DataLoader.
     max_length = 128
     dataset_obj = MSMarcoTripletDataset(triplets, vocab_dictionary, max_length=max_length)
-    batch_size = 64
-    dataloader = DataLoader(dataset_obj, batch_size=batch_size, shuffle=True, num_workers=0)
+    dataloader = DataLoader(dataset_obj, batch_size=config["batch_size"], shuffle=True, num_workers=0)
 
-    # Step 6: Instantiate the Two Tower Model.
+    # Instantiate the model.
     hidden_dim = 128
-    # Allow fine-tuning by setting freeze_embeddings=False.
     model = TwoTowerModel(vocab_size=len(vocab_dictionary),
                           embedding_dim=embedding_matrix.shape[1],
                           hidden_dim=hidden_dim,
                           pretrained_embeddings=embedding_matrix,
-                          freeze_embeddings=False)
+                          freeze_embeddings=config["freeze_embeddings"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    # Step 7: Set up optimizer and loss function.
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    # Use reduction='none' to weight individual sample losses.
-    criterion = nn.TripletMarginLoss(margin=0.2, p=2, reduction='none')
+    optimizer = optim.Adam(model.parameters(), lr=config["lr"])
+    criterion = nn.TripletMarginLoss(margin=config["margin"], p=2, reduction='none')
 
-    # Step 8: Training loop.
-    num_epochs = 5
-    for epoch in range(num_epochs):
+    # Training loop.
+    for epoch in range(config["num_epochs"]):
         model.train()
         total_loss = 0.0
         for batch_idx, (q, p, n, w) in enumerate(dataloader):
             q, p, n, w = q.to(device), p.to(device), n.to(device), w.to(device)
             optimizer.zero_grad()
             q_enc, pos_enc, neg_enc = model(q, p, n)
-            # Compute per-sample loss.
             losses = criterion(q_enc, pos_enc, neg_enc)  # shape: [batch]
             weighted_loss = (losses * w).mean()
             weighted_loss.backward()
@@ -220,22 +277,37 @@ def main():
         avg_loss = total_loss / len(dataloader)
         print(f"Epoch {epoch+1} completed. Average Loss: {avg_loss:.4f}")
 
-    # Step 9: Save model and embeddings.
-    torch.save(model.state_dict(), "output/ms_marco_two_tower.pt")
-    np.save("output/ms_marco_embeddings.npy", model.embedding.weight.data.cpu().numpy())
-    with open('output/ms_marco_word_to_index.json', 'w') as f:
-        json.dump(vocab_dictionary, f)
-    print("Training complete. Model and embeddings saved.")
+    # Evaluate on validation set.
+    mrr = evaluate_model(model, val_dataset, vocab_dictionary, embedding_matrix, max_length, device, num_queries=200)
+    print(f"Validation MRR: {mrr:.4f}")
 
-    # Step 10: Sanity Check Inference.
-    candidate_docs = [t[1] for t in triplets[:100]]
-    cached_docs = cache_document_encodings(model, candidate_docs, device, max_length)
-    print("\n--- Sanity Check Inference ---")
-    query_text = input("Enter a query: ")
-    top_indices, top_scores = infer_top_k(query_text, model, cached_docs, vocab_dictionary, max_length, k=1, device=device)
-    best_doc = candidate_docs[top_indices[0].item()]
-    print(f"Best matching document (score {top_scores[0].item():.4f}):")
-    print(best_doc)
+    # Save model and embeddings.
+    model_path = f"ms_marco_two_tower_{config['lr']}_{config['margin']}_{config['freeze_embeddings']}_{config['batch_size']}_{config['num_epochs']}.pt"
+    torch.save(model.state_dict(), model_path)
+    print("Model saved as", model_path)
+    return mrr
+
+def main():
+    # Step 1: Load MS MARCO dataset.
+    print("Loading MS MARCO dataset...")
+    train_dataset, val_dataset, test_dataset = load_ms_marco()
+    print("Train dataset size:", len(train_dataset))
+    
+    debug_samples(train_dataset, num_samples=3)
+    
+    # Step 2: Load pretrained embeddings.
+    global vocab_dictionary
+    vocab_dictionary, embedding_matrix = load_pretrained_embeddings()
+
+    # Run experiments for each configuration.
+    results = []
+    for config in hyperparameter_configs:
+        mrr = run_experiment(config, train_dataset, val_dataset, vocab_dictionary, embedding_matrix)
+        results.append((config, mrr))
+    
+    print("\n=== Experiment Results ===")
+    for config, mrr in results:
+        print(f"Config: {config} => Validation MRR: {mrr:.4f}")
 
 if __name__ == '__main__':
     import multiprocessing
