@@ -1,4 +1,3 @@
-# vocabulary.py
 import os
 import re
 from collections import Counter
@@ -69,24 +68,20 @@ class Vocabulary:
         with open("dictionary.txt", "w", encoding="utf-8") as file:
             file.write(str(self.dictionary))
 
-    def _preprocess(self, text, output_file):
+    def clean_text(self, text):
         """
-        A simpler preprocessing pipeline. 
-        You can add or remove steps (like sub-sampling) if you like.
+        Applies cleaning steps (similar to _preprocess) without file I/O.
         """
-        output_path = os.path.join("data", output_file)
-        os.makedirs("data", exist_ok=True)
-
-        # Preprocessing steps (contractions, replacements, etc.)
+        # Preprocessing steps
         text = re.sub(r"n't\b", " not", text)
         text = re.sub(r"'s\b", " is", text)
         text = re.sub(r"'re\b", " are", text)
-
+        
         # Replace mentions, hashtags, URLs
         text = re.sub(r"@\w+", " <MENTION> ", text)
         text = re.sub(r"#\w+", " <HASHTAG> ", text)
         text = re.sub(r"http\S+", " <URL> ", text)
-
+        
         # Replace punctuation with tokens
         text = text.replace(".", " <PERIOD> ")
         text = text.replace(",", " <COMMA> ")
@@ -110,20 +105,22 @@ class Vocabulary:
         text = text.replace("&", " <AMPERSAND> ")
         text = re.sub(r"\d+", " <DIGIT> ", text)
         text = re.sub(r"[^\x00-\x7F]+", " <UNICODE> ", text)
-
-        # Remove any leftover special characters
+        
+        # Remove any leftover special characters and extra whitespace
         text = re.sub(r"[^\w\s<>]", "", text)
         text = re.sub(r"\s+", " ", text)
-
+        
         # Lowercase everything
         text = text.lower()
-
-        # Tokenize and filter
-        tokens = text.lower().split()
-        tokens = [self.stemmer.stem(t) for t in tokens]
+        
+        # Tokenize and apply stemming
+        tokens = text.split()
+        tokens = [self.stemmer.stem(token) for token in tokens]
+        
+        # Filter tokens (ensure token length > 2 or special tokens)
         tokens = [t for t in tokens if len(t) > 2 or t in {"<url>", "<mention>", "<hashtag>"}]
-
-        # Apply subsampling
+        
+        # Apply subsampling logic (as in your original _preprocess)
         if self.subsample_t:
             total = len(tokens)
             if total > 0:
@@ -138,9 +135,21 @@ class Vocabulary:
                         continue
                     new_tokens.append(token)
                 tokens = new_tokens
+        return tokens
 
-        # Save processed tokens
+    def tokenize(self, text):
+        """
+        Tokenizes a single string using the cleaning and subsampling logic.
+        """
+        return self.clean_text(text)
+
+    def _preprocess(self, text, output_file):
+        """
+        Processes the full text, writes the tokens to file, and returns the tokens.
+        """
+        tokens = self.clean_text(text)
+        output_path = os.path.join("data", output_file)
+        os.makedirs("data", exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as file:
             file.write(" ".join(tokens))
-
         return tokens
