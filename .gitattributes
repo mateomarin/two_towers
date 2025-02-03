@@ -2,3 +2,4 @@ word2vec/embeddings.pt filter=lfs diff=lfs merge=lfs -text
 word2vec/embeddings.npy filter=lfs diff=lfs merge=lfs -text
 data/text8 filter=lfs diff=lfs merge=lfs -text
 data/processed-dictionary.txt filter=lfs diff=lfs merge=lfs -text
+data/cache filter=lfs diff=lfs merge=lfs -text
