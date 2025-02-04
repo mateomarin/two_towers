@@ -7,6 +7,7 @@ import random
 import json
 import numpy as np
 from datasets import load_dataset
+import matplotlib.pyplot as plt
 
 from two_tower_model import TwoTowerModel
 from dataset_ms_marco import MSMarcoTripletDataset
@@ -36,7 +37,6 @@ def extract_positives(sample):
         is_selected = passages.get("is_selected", [])
         passage_texts = passages.get("passage_text", [])
         for idx, text in enumerate(passage_texts):
-            # Higher weight for selected passages (is_selected==1), lower weight otherwise.
             weight = 2.0 if idx < len(is_selected) and is_selected[idx] == 1 else 1.0
             positives.append((text, weight))
     return positives
@@ -49,13 +49,12 @@ def build_negative_corpus(dataset):
     return list(corpus)
 
 def sample_hard_negative(query, positive, corpus, vocab_dictionary, embedding_matrix, candidate_pool_size=10):
-    # Compute a simple average embedding (using pretrained embedding_matrix) for the text.
     def average_embedding(text):
         tokens = simple_tokenize(text)
         indices = tokens_to_indices(tokens, vocab_dictionary)
         if len(indices) == 0:
             return None
-        vecs = embedding_matrix[indices]  # shape: [num_tokens, emb_dim]
+        vecs = embedding_matrix[indices]
         avg = vecs.mean(dim=0)
         norm = avg.norm() + 1e-8
         return avg / norm
@@ -70,13 +69,11 @@ def sample_hard_negative(query, positive, corpus, vocab_dictionary, embedding_ma
         cand_emb = average_embedding(cand)
         if cand_emb is None:
             continue
-        sim = torch.dot(q_emb, cand_emb).item()  # cosine similarity (since normalized)
+        sim = torch.dot(q_emb, cand_emb).item()  # cosine similarity
         if sim > best_sim:
             best_sim = sim
             best_candidate = cand
-    if best_candidate is None:
-        return random.choice(corpus)
-    return best_candidate
+    return best_candidate if best_candidate is not None else random.choice(corpus)
 
 def generate_triplets(train_dataset, max_samples=50000):
     triplets = []
@@ -88,7 +85,7 @@ def generate_triplets(train_dataset, max_samples=50000):
         if not query or not pos_list:
             continue
         for pos, weight in pos_list:
-            triplets.append((query, pos, None, weight))  # negative to be filled later.
+            triplets.append((query, pos, None, weight))  # Negative to be assigned later.
     return triplets
 
 def assign_negatives(triplets, negative_corpus, vocab_dictionary, embedding_matrix):
@@ -175,16 +172,12 @@ def evaluate_model(model, val_dataset, vocab_dictionary, embedding_matrix, max_l
     import torch.nn.functional as F
     # Build candidate corpus from first num_queries validation samples.
     candidates = []
-    ground_truth = []
     for i in range(min(num_queries, len(val_dataset))):
         sample = val_dataset[i]
-        query = sample.get("query", "")
         pos = extract_positives(sample)
-        if not query or not pos:
+        if not pos:
             continue
-        # For evaluation, take the first positive as ground truth.
         candidates.append(pos[0][0])
-        ground_truth.append(pos[0][0])
     if not candidates:
         return 0.0
     candidate_embs = []
@@ -210,12 +203,11 @@ def evaluate_model(model, val_dataset, vocab_dictionary, embedding_matrix, max_l
             continue
         sims = torch.matmul(candidate_embs, q_emb.unsqueeze(1)).squeeze(1)
         sorted_indices = torch.argsort(sims, descending=True)
-        # Find rank of the true document in the candidate set.
         try:
             rank = (sorted_indices == i).nonzero(as_tuple=True)[0].item() + 1
             mrr_total += 1.0 / rank
             count += 1
-        except Exception as e:
+        except Exception:
             continue
     mrr = mrr_total / count if count > 0 else 0.0
     return mrr
@@ -231,22 +223,29 @@ hyperparameter_configs = [
     {"lr": 0.002, "margin": 0.2, "freeze_embeddings": False, "batch_size": 32, "num_epochs": 5}
 ]
 
+##########################
+# Experiment Runner
+##########################
 def run_experiment(config, train_dataset, val_dataset, vocab_dictionary, embedding_matrix):
     print("\n\n=== Running Configuration ===")
     print(config)
-    # Build negative corpus and generate triplets from training data.
+    # Build negative corpus and generate triplets.
     negative_corpus = build_negative_corpus(train_dataset)
     triplets = generate_triplets(train_dataset, max_samples=50000)
-    # Use hard negative sampling.
     triplets = assign_negatives(triplets, negative_corpus, vocab_dictionary, embedding_matrix)
     print("Generated", len(triplets), "triplets for training.")
+    print("\n--- Example Triplets ---")
+    for t in triplets[:3]:
+        print("Query:", t[0])
+        print("Positive:", t[1][:150] + "...")
+        print("Negative:", t[2][:150] + "...")
+        print("Weight:", t[3])
+        print("-" * 80)
 
-    # Create Dataset and DataLoader.
     max_length = 128
     dataset_obj = MSMarcoTripletDataset(triplets, vocab_dictionary, max_length=max_length)
     dataloader = DataLoader(dataset_obj, batch_size=config["batch_size"], shuffle=True, num_workers=0)
 
-    # Instantiate the model.
     hidden_dim = 128
     model = TwoTowerModel(vocab_size=len(vocab_dictionary),
                           embedding_dim=embedding_matrix.shape[1],
@@ -259,7 +258,6 @@ def run_experiment(config, train_dataset, val_dataset, vocab_dictionary, embeddi
     optimizer = optim.Adam(model.parameters(), lr=config["lr"])
     criterion = nn.TripletMarginLoss(margin=config["margin"], p=2, reduction='none')
 
-    # Training loop.
     for epoch in range(config["num_epochs"]):
         model.train()
         total_loss = 0.0
@@ -267,7 +265,7 @@ def run_experiment(config, train_dataset, val_dataset, vocab_dictionary, embeddi
             q, p, n, w = q.to(device), p.to(device), n.to(device), w.to(device)
             optimizer.zero_grad()
             q_enc, pos_enc, neg_enc = model(q, p, n)
-            losses = criterion(q_enc, pos_enc, neg_enc)  # shape: [batch]
+            losses = criterion(q_enc, pos_enc, neg_enc)
             weighted_loss = (losses * w).mean()
             weighted_loss.backward()
             optimizer.step()
@@ -277,37 +275,71 @@ def run_experiment(config, train_dataset, val_dataset, vocab_dictionary, embeddi
         avg_loss = total_loss / len(dataloader)
         print(f"Epoch {epoch+1} completed. Average Loss: {avg_loss:.4f}")
 
-    # Evaluate on validation set.
     mrr = evaluate_model(model, val_dataset, vocab_dictionary, embedding_matrix, max_length, device, num_queries=200)
     print(f"Validation MRR: {mrr:.4f}")
 
-    # Save model and embeddings.
-    model_path = f"ms_marco_two_tower_{config['lr']}_{config['margin']}_{config['freeze_embeddings']}_{config['batch_size']}_{config['num_epochs']}.pt"
+    # Save experiment outputs in a dedicated folder.
+    exp_folder = os.path.join("output", f"lr_{config['lr']}_margin_{config['margin']}_freeze_{config['freeze_embeddings']}_bs_{config['batch_size']}_ep_{config['num_epochs']}")
+    os.makedirs(exp_folder, exist_ok=True)
+    model_path = os.path.join(exp_folder, "model.pt")
     torch.save(model.state_dict(), model_path)
-    print("Model saved as", model_path)
-    return mrr
+    np.save(os.path.join(exp_folder, "embeddings.npy"), model.embedding.weight.data.cpu().numpy())
+    with open(os.path.join(exp_folder, "vocab.json"), 'w') as f:
+        json.dump(vocab_dictionary, f)
+    with open(os.path.join(exp_folder, "config.json"), 'w') as f:
+        json.dump(config, f)
+    print("Experiment outputs saved in", exp_folder)
+    return config, mrr, exp_folder
 
+##########################
+# Main Experiment Loop
+##########################
 def main():
-    # Step 1: Load MS MARCO dataset.
     print("Loading MS MARCO dataset...")
     train_dataset, val_dataset, test_dataset = load_ms_marco()
     print("Train dataset size:", len(train_dataset))
     
     debug_samples(train_dataset, num_samples=3)
     
-    # Step 2: Load pretrained embeddings.
     global vocab_dictionary
     vocab_dictionary, embedding_matrix = load_pretrained_embeddings()
-
-    # Run experiments for each configuration.
+    
     results = []
+    exp_folders = []
     for config in hyperparameter_configs:
-        mrr = run_experiment(config, train_dataset, val_dataset, vocab_dictionary, embedding_matrix)
+        config_result, mrr, exp_folder = run_experiment(config, train_dataset, val_dataset, vocab_dictionary, embedding_matrix)
         results.append((config, mrr))
+        exp_folders.append(exp_folder)
     
     print("\n=== Experiment Results ===")
     for config, mrr in results:
         print(f"Config: {config} => Validation MRR: {mrr:.4f}")
+    
+    # Plot results for comparison.
+    config_labels = []
+    mrr_values = []
+    for config, mrr in results:
+        label = f"lr={config['lr']}, m={config['margin']}, freeze={config['freeze_embeddings']}, bs={config['batch_size']}, ep={config['num_epochs']}"
+        config_labels.append(label)
+        mrr_values.append(mrr)
+    
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(config_labels, mrr_values, color='skyblue')
+    plt.ylabel("Validation MRR")
+    plt.xlabel("Hyperparameter Configuration")
+    plt.title("Hyperparameter Comparison")
+    plt.xticks(rotation=45, ha='right')
+    plt.ylim(0, max(mrr_values) * 1.2)
+    for bar in bars:
+        height = bar.get_height()
+        plt.annotate(f"{height:.3f}",
+                     xy=(bar.get_x() + bar.get_width() / 2, height),
+                     xytext=(0, 3),
+                     textcoords="offset points",
+                     ha="center", va="bottom")
+    plt.tight_layout()
+    plt.savefig("output/hyperparameter_comparison.png")
+    plt.show()
 
 if __name__ == '__main__':
     import multiprocessing
