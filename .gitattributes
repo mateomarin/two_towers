@@ -10,3 +10,8 @@ output/ filter=lfs diff=lfs merge=lfs -text
 output/ms_marco_embeddings.npy filter=lfs diff=lfs merge=lfs -text
 output/ms_marco_two_tower.pt filter=lfs diff=lfs merge=lfs -text
 output/ms_marco_word_to_index.json filter=lfs diff=lfs merge=lfs -text
+simple_two_tower.pt filter=lfs diff=lfs merge=lfs -text
+output/run_20250205_113840 filter=lfs diff=lfs merge=lfs -text
+output/hyperparameter_comparison.png filter=lfs diff=lfs merge=lfs -text
+output/run_20250205_113026 filter=lfs diff=lfs merge=lfs -text
+output/run_20250205_113246 filter=lfs diff=lfs merge=lfs -text
