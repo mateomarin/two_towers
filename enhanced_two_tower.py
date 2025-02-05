@@ -84,9 +84,23 @@ class MarginRankingLoss(nn.Module):
             loss = nn.functional.cross_entropy(sim_matrix, labels)
             return loss
         else:
-            # With explicit negative examples
+            # Reshape neg_doc_vec to match query_vec
+            batch_size = query_vec.size(0)
+            num_negatives = neg_doc_vec.size(0) // batch_size
+            
+            # Reshape query_vec to compare with each negative
+            query_vec_expanded = query_vec.unsqueeze(1).expand(-1, num_negatives, -1)
+            neg_doc_vec = neg_doc_vec.view(batch_size, num_negatives, -1)
+            
+            # Compute similarities
             pos_sim = torch.nn.functional.cosine_similarity(query_vec, pos_doc_vec)
-            neg_sim = torch.nn.functional.cosine_similarity(query_vec, neg_doc_vec)
+            neg_sim = torch.nn.functional.cosine_similarity(
+                query_vec_expanded, 
+                neg_doc_vec, 
+                dim=2
+            ).mean(dim=1)  # Average over negatives
+            
+            # Compute loss
             loss = torch.mean(torch.clamp(self.margin - pos_sim + neg_sim, min=0))
             return loss
 
