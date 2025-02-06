@@ -10,60 +10,76 @@ from tqdm import tqdm
 import os
 from datetime import datetime
 
-class EnhancedTwoTower(nn.Module):
+class EnhancedTwoTowerModel(nn.Module):
     def __init__(self, embedding_dim: int, hidden_dim: int):
         super().__init__()
-        # Same base architecture as SimpleTwoTower
+        # Increased hidden size and layers for better representation
         self.query_encoder = nn.GRU(
             input_size=embedding_dim,
-            hidden_size=hidden_dim,
-            num_layers=2,
+            hidden_size=hidden_dim * 2,  # Double hidden size
+            num_layers=2,  # Two layers
             batch_first=True,
             bidirectional=True,
-            dropout=0.1
-        )
-        self.doc_encoder = nn.GRU(
-            input_size=embedding_dim,
-            hidden_size=hidden_dim,
-            num_layers=2,
-            batch_first=True,
-            bidirectional=True,
-            dropout=0.1
+            dropout=0.1  # Light dropout between layers
         )
         
-        # Enhanced projection networks
+        self.doc_encoder = nn.GRU(
+            input_size=embedding_dim,
+            hidden_size=hidden_dim * 2,  # Double hidden size
+            num_layers=2,  # Two layers
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.1  # Light dropout between layers
+        )
+        
+        # Enhanced projection layers
         self.query_proj = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim * 4, hidden_dim * 2),  # 4x from bidirectional GRU
+            nn.LayerNorm(hidden_dim * 2),  # Add normalization
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim // 2)
+            nn.Linear(hidden_dim * 2, hidden_dim)
         )
         
         self.doc_proj = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim * 4, hidden_dim * 2),  # 4x from bidirectional GRU
+            nn.LayerNorm(hidden_dim * 2),  # Add normalization
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim // 2)
+            nn.Linear(hidden_dim * 2, hidden_dim)
         )
-    
+
     def encode_query(self, query_emb):
-        _, query_hidden = self.query_encoder(query_emb)
-        query_hidden = torch.cat((query_hidden[-2], query_hidden[-1]), dim=1)
-        query_vec = self.query_proj(query_hidden)
-        return nn.functional.normalize(query_vec, p=2, dim=1)
+        _, hidden = self.query_encoder(query_emb)
+        # Concatenate last layer's bidirectional states
+        query_vec = torch.cat((hidden[-2], hidden[-1]), dim=1)
+        return self.query_proj(query_vec)
     
     def encode_doc(self, doc_emb):
-        _, doc_hidden = self.doc_encoder(doc_emb)
-        doc_hidden = torch.cat((doc_hidden[-2], doc_hidden[-1]), dim=1)
-        doc_vec = self.doc_proj(doc_hidden)
-        return nn.functional.normalize(doc_vec, p=2, dim=1)
+        _, hidden = self.doc_encoder(doc_emb)
+        # Concatenate last layer's bidirectional states
+        doc_vec = torch.cat((hidden[-2], hidden[-1]), dim=1)
+        return self.doc_proj(doc_vec)
     
     def forward(self, query_emb, doc_emb):
         query_vec = self.encode_query(query_emb)
         doc_vec = self.encode_doc(doc_emb)
         return query_vec, doc_vec
+
+class InfoNCELoss(nn.Module):
+    def __init__(self, temperature=0.07):  # Lower temperature for sharper contrasts
+        super().__init__()
+        self.temperature = temperature
+        
+    def forward(self, query_vec, doc_vec):
+        # L2 normalize
+        query_vec = nn.functional.normalize(query_vec, p=2, dim=1)
+        doc_vec = nn.functional.normalize(doc_vec, p=2, dim=1)
+        
+        # Compute similarity matrix
+        sim_matrix = torch.matmul(query_vec, doc_vec.t()) / self.temperature
+        
+        # Regular cross entropy with temperature scaling
+        labels = torch.arange(len(query_vec), device=query_vec.device)
+        return nn.functional.cross_entropy(sim_matrix, labels)
 
 class MarginRankingLoss(nn.Module):
     def __init__(self, margin=0.2, temperature=0.1):
