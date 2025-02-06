@@ -11,32 +11,34 @@ class TwoTowerModel(nn.Module):
         self.query_encoder = nn.GRU(
             input_size=embedding_dim,
             hidden_size=hidden_dim,
-            num_layers=1,
+            num_layers=2,  # Keep 2 layers for better sequence understanding
             batch_first=True,
             bidirectional=True,
-            dropout=0
+            dropout=0.1  # Keep dropout for regularization
         )
         
         self.doc_encoder = nn.GRU(
             input_size=embedding_dim,
             hidden_size=hidden_dim,
-            num_layers=1,
+            num_layers=2,
             batch_first=True,
             bidirectional=True,
-            dropout=0
+            dropout=0.1
         )
         
-        # Project to hidden_dim with single layer
+        # Simpler but effective projection layers
         self.query_proj = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.Dropout(0.1)
         )
         
         self.doc_proj = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.Dropout(0.1)
         )
 
     def encode_query(self, query_emb):
@@ -112,45 +114,29 @@ class SimpleDataset(Dataset):
     def text_to_embedding(text: str, word2vec, max_length: int = 30) -> torch.Tensor:
         embedding_dim = word2vec.vector_size
         
-        # Normalize numbers and currency
-        text = re.sub(r'\$?\d+(?:\.\d+)?(?:k|m|b|bn)?\b', 'NUMBER', text.lower())
-        text = re.sub(r'\b(usd|inr|rs|gbp|eur|dollars?|rupees?)\b', 'CURRENCY', text.lower())
+        # Preserve numbers but normalize format
+        text = re.sub(r'\$(\d+(?:\.\d+)?)', r'PRICE \1', text.lower())
+        text = re.sub(r'(\d+(?:\.\d+)?)\s*(°c|celsius)', r'\1 CELSIUS', text.lower())
+        text = re.sub(r'(\d+(?:\.\d+)?)\s*(km|miles?|ft|feet)', r'\1 DISTANCE', text.lower())
         
-        # Normalize units
-        text = re.sub(r'\b(kg|kgs|kilometer|km|cm|mm|ml|lb|lbs|ft|feet|mph|kmh|celsius|fahrenheit)\b', 'UNIT', text.lower())
-        text = re.sub(r'\b(mg|mcg|ml|gram|grams)\b', 'MEDICAL_UNIT', text.lower())
+        # Location handling (less aggressive)
+        text = re.sub(r'\b(located|situated|found)\s+(in|at|near)\b', 'LOCATION', text.lower())
+        text = re.sub(r'\b(north|south|east|west)\s+of\b', 'DIRECTION_OF', text.lower())
         
-        # Normalize time
-        text = re.sub(r'\b(years?|months?|weeks?|days?|hours?|minutes?|seconds?)\b', 'TIME_UNIT', text.lower())
+        # Definition handling (preserve terms)
+        text = re.sub(r'\b(what\s+is|define|meaning\s+of)\s+(\w+)\b', r'DEFINE \2', text.lower())
+        text = re.sub(r'\b(refers?\s+to|known\s+as)\b', 'MEANS', text.lower())
         
-        # Normalize percentages
-        text = re.sub(r'\d+%', 'PERCENTAGE', text.lower())
+        # Query type markers
+        text = re.sub(r'^(how|what|where|when|why|who)\b', r'QUERY_\1', text.lower())
+        text = re.sub(r'^(is|are|can|does|do)\b', 'QUERY_YN', text.lower())  # Yes/No questions
         
-        # Normalize locations
-        text = re.sub(r'\b(street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr)\b', 'STREET', text.lower())
-        text = re.sub(r'\b(po box|p\.o\. box)\b', 'POBOX', text.lower())
+        # Time expressions
+        text = re.sub(r'\b(\d+)\s*(year|month|week|day|hour)s?\b', r'\1 TIME_\2', text.lower())
         
-        # Normalize measurements
-        text = re.sub(r'\b(square|sq|cubic|cu)\b', 'MEASURE_TYPE', text.lower())
-        text = re.sub(r'\b(length|width|height|depth)\b', 'DIMENSION', text.lower())
-        
-        # Normalize semantic variations
-        text = re.sub(r'\b(cost|price|fee|charge|rate)\b', 'COST', text.lower())
-        text = re.sub(r'\b(per|every|each|a)\s+(hour|hr|day|month|year)\b', 'PER_TIME', text.lower())
-        text = re.sub(r'\b(use|utilize|employ|apply)\b', 'USE', text.lower())
-        text = re.sub(r'\b(process|procedure|method|technique)\b', 'PROCESS', text.lower())
-        
-        # Normalize definitions
-        text = re.sub(r'\b(is|are|refers to|defined as|means)\b', 'IS', text.lower())
-        text = re.sub(r'\b(consists of|composed of|made of|contains)\b', 'CONTAINS', text.lower())
-        
-        # Normalize quantities
-        text = re.sub(r'\b(about|approximately|around|roughly)\b', 'APPROXIMATELY', text.lower())
-        text = re.sub(r'\b(between|from|range)\b', 'RANGE', text.lower())
-        
-        # Improved word handling
+        # Process words
         embeddings = []
-        words = re.findall(r'\w+|\S', text.lower())
+        words = text.split()
         words = words[:max_length]
         
         for word in words:
@@ -160,29 +146,13 @@ class SimpleDataset(Dataset):
                 embeddings.append(emb)
             except KeyError:
                 try:
-                    # Try without punctuation
+                    # Try without special chars
                     clean_word = re.sub(r'[^\w\s]', '', word)
                     emb = word2vec[clean_word]
                     embeddings.append(emb)
                 except KeyError:
-                    # Try subwords
-                    subwords = word.split('-')
-                    if len(subwords) > 1:
-                        subword_embs = []
-                        for subword in subwords:
-                            try:
-                                emb = word2vec[subword]
-                                subword_embs.append(emb)
-                            except KeyError:
-                                continue
-                        if subword_embs:
-                            # Average the subword embeddings
-                            emb = np.mean(subword_embs, axis=0)
-                            embeddings.append(emb)
-                        continue
-                    
-                    # Try word parts (for compound words)
-                    parts = re.findall(r'[a-z]+', word.lower())
+                    # Handle compound words
+                    parts = word.split('_')
                     if len(parts) > 1:
                         part_embs = []
                         for part in parts:
@@ -192,10 +162,8 @@ class SimpleDataset(Dataset):
                             except KeyError:
                                 continue
                         if part_embs:
-                            # Average the part embeddings
                             emb = np.mean(part_embs, axis=0)
                             embeddings.append(emb)
-                        continue
         
         if not embeddings:
             embeddings = [np.zeros(embedding_dim)]
@@ -208,14 +176,6 @@ class SimpleDataset(Dataset):
         else:
             embeddings = embeddings[:max_length]
             
-        # Add specificity score
-        specificity_words = ['specifically', 'exactly', 'precisely', 'namely']
-        specificity_score = sum(1 for w in words if w in specificity_words)
-        
-        # Modify embeddings based on specificity
-        if specificity_score > 0:
-            embeddings *= (1 + 0.1 * specificity_score)
-        
         return torch.tensor(embeddings, dtype=torch.float32)
     
     def __len__(self):
