@@ -103,7 +103,9 @@ def main():
                 train_dataset_chunk,
                 batch_size=batch_size,
                 shuffle=True,
-                num_workers=4
+                num_workers=4,
+                pin_memory=True,
+                persistent_workers=True
             )
             
             for batch_idx, (query_emb, doc_emb) in enumerate(train_loader):

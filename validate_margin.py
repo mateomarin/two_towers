@@ -102,64 +102,50 @@ def main():
     
     print(f"Built index with {len(val_docs)} documents")
     
-    # Test queries
-    print("\nTesting with MS MARCO validation queries...")
+    # Filter test queries to only include those with valid ground truth
+    valid_test_queries = [
+        query for query in query_to_relevant 
+        if query_to_relevant[query]  # Check if there are any relevant documents
+    ]
+
+    # Take a random sample of queries for testing
     num_test_queries = 20
-    total_mrr = 0
-    queries_evaluated = 0
+    if len(valid_test_queries) > num_test_queries:
+        valid_test_queries = random.sample(valid_test_queries, num_test_queries)
+
+    print(f"\nTesting with {len(valid_test_queries)} valid MS MARCO validation queries...\n")
     
-    os.makedirs(args.output_dir, exist_ok=True)
-    with open(os.path.join(args.output_dir, "validation_results.txt"), "w") as f:
-        # Select random queries that have answers
-        valid_samples = [
-            s for s in validation 
-            if s.get("query") and (s.get("answers") or s.get("wellFormedAnswers"))
-        ]
-        random.shuffle(valid_samples)
+    mrr_sum = 0
+    for query in valid_test_queries:
+        print(f"\nQuery: {query}")
         
-        for sample in valid_samples[:num_test_queries]:
-            query = sample.get("query", "")
-            answers = sample.get("answers", [])
-            wellFormedAnswers = sample.get("wellFormedAnswers", [])
-            answer = wellFormedAnswers[0] if wellFormedAnswers else answers[0]
-            
-            # Find passage containing the answer
-            relevant_docs = query_to_relevant.get(query, set())
-            ground_truth_passage = None
-            for passage in relevant_docs:
-                if answer.lower() in passage.lower():
-                    ground_truth_passage = passage
-                    break
-            
-            # Use first relevant passage if answer not found
-            if not ground_truth_passage and relevant_docs:
-                ground_truth_passage = next(iter(relevant_docs))
-            
-            mrr, top_results = compute_mrr(model, query, relevant_docs, val_docs, word2vec, device)
-            total_mrr += mrr
-            queries_evaluated += 1
-            
-            # Log results
-            print(f"\nQuery: {query}")
-            print(f"Ground Truth Answer: {answer}")
-            print(f"Ground Truth Passage: {ground_truth_passage[:100]}...")
-            print(f"MRR: {mrr:.4f}")
-            for rank, (doc, score) in enumerate(top_results, 1):
-                is_relevant = "✓" if doc in relevant_docs else " "
-                print(f"{rank}. [{is_relevant}] ({score:.4f}) {doc[:100]}...")
-                
-            # Write to file
+        # Get ground truth info
+        ground_truth_answer = next(iter(query_to_relevant[query]))
+        ground_truth_passage = ground_truth_answer
+        
+        print(f"Ground Truth Answer: {ground_truth_answer}")
+        print(f"Ground Truth Passage: {ground_truth_passage[:100]}...")
+        
+        mrr, top_results = compute_mrr(model, query, query_to_relevant[query], val_docs, word2vec, device)
+        mrr_sum += mrr
+        
+        # Log results
+        print(f"MRR: {mrr:.4f}")
+        for rank, (doc, score) in enumerate(top_results, 1):
+            is_relevant = "✓" if doc in query_to_relevant[query] else " "
+            print(f"{rank}. [{is_relevant}] ({score:.4f}) {doc[:100]}...")
+        
+        # Write to file
+        with open(os.path.join(args.output_dir, "validation_results.txt"), "a") as f:
             f.write(f"\nQuery: {query}\n")
-            f.write(f"Ground Truth Answer: {answer}\n")
+            f.write(f"Ground Truth Answer: {ground_truth_answer}\n")
             f.write(f"Ground Truth Passage: {ground_truth_passage}\n")
             f.write(f"MRR: {mrr:.4f}\n")
             for rank, (doc, score) in enumerate(top_results, 1):
-                is_relevant = "✓" if doc in relevant_docs else " "
+                is_relevant = "✓" if doc in query_to_relevant[query] else " "
                 f.write(f"{rank}. [{is_relevant}] ({score:.4f}) {doc[:100]}...\n")
     
-        avg_mrr = total_mrr / queries_evaluated
-        print(f"\nAverage MRR over {queries_evaluated} queries: {avg_mrr:.4f}")
-        f.write(f"\nAverage MRR over {queries_evaluated} queries: {avg_mrr:.4f}\n")
+    print(f"\nAverage MRR over {len(valid_test_queries)} queries: {mrr_sum / len(valid_test_queries):.4f}")
 
 if __name__ == "__main__":
     main() 

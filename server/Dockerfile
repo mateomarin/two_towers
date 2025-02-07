@@ -1,43 +1,47 @@
-# Use a Python base image (we’ll add Node and Supervisor)
+# Use a Python base image (we'll add Node and Supervisor)
 FROM python:3.9-slim
 
-# Install Node.js (using Node 16 as an example) and Supervisor
+# Install system dependencies
 RUN apt-get update && \
-    apt-get install -y curl supervisor && \
-    curl -fsSL https://deb.nodesource.com/setup_16.x | bash - && \
+    apt-get install -y curl supervisor \
+    gcc \
+    g++ \
+    gfortran \
+    libopenblas-dev \
+    && curl -fsSL https://deb.nodesource.com/setup_16.x | bash - && \
     apt-get install -y nodejs && \
     apt-get clean
 
-# Set working directory
 WORKDIR /app
 
-# --- Set up the Python API ---
-# Copy Python API code into container
-COPY python-api/ ./python-api/
+# Copy and install Python API requirements first
+COPY python-api/requirements.txt ./pythonapi/
+RUN pip install --no-cache-dir -r pythonapi/requirements.txt
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r python-api/requirements.txt
+# Copy Python API files
+COPY python-api/ ./pythonapi/
+RUN mkdir -p /app/pythonapi/model
+RUN touch /app/pythonapi/__init__.py
+RUN touch /app/pythonapi/model/__init__.py
+COPY python-api/utils.py ./pythonapi/
+COPY python-api/model/margin_two_tower.py ./pythonapi/model/
+COPY python-api/model/best_model.pt ./pythonapi/model/
 
-# --- Set up the Next.js App ---
-# Copy Next.js app code into container
+# Copy Next.js frontend files
+RUN mkdir -p /app/nextjs-frontend/pages /app/nextjs-frontend/styles
 COPY nextjs-frontend/ ./nextjs-frontend/
 
-# Change directory to nextjs-frontend and install dependencies
+# Install Next.js dependencies and build
 WORKDIR /app/nextjs-frontend
 RUN npm install
-
-# (Optional) Build the Next.js app if you plan to run it in production mode.
 RUN npm run build
 
-# Return to the /app directory
+# Setup supervisor to run both services
+COPY supervisord.conf /etc/supervisor/conf.d/
+
 WORKDIR /app
 
-# --- Configure Supervisor ---
-# Copy Supervisor configuration into the container
-COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+# Expose ports for Python API (8000) and Next.js (3000)
+EXPOSE 8000 3000
 
-# Expose the ports used by the applications
-EXPOSE 5000 3000
-
-# Start Supervisor (which will in turn start both services)
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
+CMD ["/usr/bin/supervisord"]
